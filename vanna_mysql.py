@@ -209,6 +209,39 @@ class KnowledgeBase:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
+        # DDL表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ddl_statements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                embedding BLOB,
+                table_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # 文档表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS documentation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                embedding BLOB,
+                category TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # 问答对表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS question_sql_pairs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                question TEXT NOT NULL,
+                sql TEXT NOT NULL,
+                question_embedding BLOB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
         conn.commit()
         conn.close()
     
@@ -455,6 +488,49 @@ class VannaMySQLConnector:
             logger.error(f"获取表信息失败: {e}")
             return {}
     
+    def get_table_ddl(self, table_name: str) -> str:
+        """获取表的DDL语句"""
+        try:
+            if not self.connection or not self.connection.is_connected():
+                self.connect()
+            
+            cursor = self.connection.cursor()
+            cursor.execute(f"SHOW CREATE TABLE {table_name}")
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if result:
+                return result[1]  # 返回CREATE TABLE语句
+            return ""
+            
+        except Error as e:
+            logger.error(f"获取表DDL失败: {e}")
+            return ""
+    
+    def get_all_tables_ddl(self) -> Dict[str, str]:
+        """获取所有表的DDL语句"""
+        try:
+            if not self.connection or not self.connection.is_connected():
+                self.connect()
+            
+            cursor = self.connection.cursor()
+            cursor.execute("SHOW TABLES")
+            tables = [table[0] for table in cursor.fetchall()]
+            cursor.close()
+            
+            ddl_dict = {}
+            for table in tables:
+                ddl = self.get_table_ddl(table)
+                if ddl:
+                    ddl_dict[table] = ddl
+            
+            logger.info(f"成功获取 {len(ddl_dict)} 个表的DDL语句")
+            return ddl_dict
+            
+        except Error as e:
+            logger.error(f"获取所有表DDL失败: {e}")
+            return {}
+    
     def close(self):
         """关闭数据库连接"""
         if self.connection and self.connection.is_connected():
@@ -488,7 +564,59 @@ class VannaMySQL:
     def connect_to_mysql(self, **kwargs):
         """连接到MySQL数据库"""
         self.mysql_connector = VannaMySQLConnector(**kwargs)
-        return self.mysql_connector.connect()
+        success = self.mysql_connector.connect()
+        
+        # 如果连接成功，自动同步表信息到知识库
+        if success:
+            self.sync_database_schema()
+        
+        return success
+    
+    def sync_database_schema(self):
+        """同步数据库表结构到知识库"""
+        if not self.mysql_connector:
+            logger.warning("未连接到MySQL数据库，跳过表结构同步")
+            return
+        
+        try:
+            logger.info("🔄 正在同步数据库表结构到知识库...")
+            
+            # 获取所有表的DDL
+            all_ddl = self.mysql_connector.get_all_tables_ddl()
+            
+            if not all_ddl:
+                logger.warning("未找到任何表结构")
+                return
+            
+            # 将DDL添加到知识库
+            synced_count = 0
+            for table_name, ddl in all_ddl.items():
+                if self.knowledge_base.add_ddl(ddl):
+                    synced_count += 1
+                    
+                    # 同时添加表的基本描述
+                    description = f"{table_name}表的结构信息，包含列定义、数据类型、约束等"
+                    self.knowledge_base.add_documentation(description, f"table_{table_name}")
+            
+            logger.info(f"✅ 成功同步 {synced_count}/{len(all_ddl)} 个表的结构到知识库")
+            
+        except Exception as e:
+            logger.error(f"❌ 同步数据库表结构失败: {e}")
+    
+    def refresh_database_schema(self):
+        """刷新数据库表结构（重新同步）"""
+        if not self.mysql_connector:
+            logger.warning("未连接到MySQL数据库")
+            return False
+        
+        try:
+            # 清空现有的DDL数据（可选）
+            # 这里我们选择不清空，而是更新或添加新的
+            self.sync_database_schema()
+            return True
+        except Exception as e:
+            logger.error(f"刷新数据库表结构失败: {e}")
+            return False
     
     def train(self, ddl: str = None, documentation: str = None, question: str = None, sql: str = None):
         """训练模型"""
@@ -516,6 +644,13 @@ class VannaMySQL:
             
             # 构建上下文
             context = self._build_context(related_ddl, related_docs, similar_questions, table_info)
+            
+            # 调试输出
+            logger.info(f"🔍 检索到的相关DDL数量: {len(related_ddl)}")
+            logger.info(f"🔍 检索到的相关文档数量: {len(related_docs)}")
+            logger.info(f"🔍 检索到的相似问题数量: {len(similar_questions)}")
+            if related_ddl:
+                logger.info(f"🔍 相关DDL内容预览: {related_ddl[0][:200]}...")
             
             # 构建系统提示
             system_prompt = self._build_system_prompt()
@@ -644,6 +779,9 @@ class VannaMySQL:
     
     def _clean_sql(self, sql: str) -> str:
         """清理SQL语句"""
+        # 移除DeepSeek-R1模型的思考标签
+        sql = re.sub(r'<think>.*?</think>', '', sql, flags=re.DOTALL)
+        
         # 移除多余的空白和换行
         sql = re.sub(r'\s+', ' ', sql.strip())
         
@@ -676,18 +814,20 @@ def create_flask_app(vanna_instance: VannaMySQL) -> Flask:
             max-width: 1200px;
             margin: 0 auto;
             padding: 20px;
-            background-color: #f5f5f5;
+            background-color: #1a1a1a;
+            color: #e0e0e0;
         }
         .header {
             text-align: center;
-            color: #333;
+            color: #ffffff;
             margin-bottom: 30px;
         }
         .container {
-            background: white;
+            background: #2d2d2d;
             padding: 30px;
             border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+            border: 1px solid #404040;
         }
         .form-group {
             margin-bottom: 20px;
@@ -696,47 +836,57 @@ def create_flask_app(vanna_instance: VannaMySQL) -> Flask:
             display: block;
             margin-bottom: 5px;
             font-weight: bold;
-            color: #333;
+            color: #e0e0e0;
         }
         input[type="text"], textarea {
             width: 100%;
             padding: 12px;
-            border: 1px solid #ddd;
+            border: 1px solid #555;
             border-radius: 5px;
             font-size: 16px;
             box-sizing: border-box;
+            background-color: #3a3a3a;
+            color: #e0e0e0;
+        }
+        input[type="text"]:focus, textarea:focus {
+            outline: none;
+            border-color: #6b7280;
+            box-shadow: 0 0 5px rgba(107, 114, 128, 0.3);
         }
         textarea {
             height: 80px;
             resize: vertical;
         }
         button {
-            background-color: #007bff;
-            color: white;
+            background-color: #4a5568;
+            color: #e0e0e0;
             padding: 12px 24px;
             border: none;
             border-radius: 5px;
             cursor: pointer;
             font-size: 16px;
             margin-right: 10px;
+            transition: background-color 0.3s ease;
         }
         button:hover {
-            background-color: #0056b3;
+            background-color: #5a6578;
         }
         .result {
             margin-top: 30px;
             padding: 20px;
-            background-color: #f8f9fa;
+            background-color: #333333;
             border-radius: 5px;
-            border-left: 4px solid #007bff;
+            border-left: 4px solid #6b7280;
         }
         .sql-code {
-            background-color: #f1f3f4;
+            background-color: #2a2a2a;
             padding: 15px;
             border-radius: 5px;
             font-family: 'Courier New', monospace;
             white-space: pre-wrap;
             margin: 10px 0;
+            border: 1px solid #555;
+            color: #f8f8f2;
         }
         table {
             width: 100%;
@@ -744,26 +894,31 @@ def create_flask_app(vanna_instance: VannaMySQL) -> Flask:
             margin-top: 15px;
         }
         th, td {
-            border: 1px solid #ddd;
+            border: 1px solid #555;
             padding: 8px;
             text-align: left;
         }
         th {
-            background-color: #f2f2f2;
+            background-color: #404040;
             font-weight: bold;
+            color: #ffffff;
+        }
+        td {
+            background-color: #2d2d2d;
         }
         .error {
-            color: #dc3545;
-            background-color: #f8d7da;
-            border-color: #f5c6cb;
+            color: #ff6b6b;
+            background-color: #4d1f1f;
+            border-color: #6b2c2c;
             padding: 10px;
             border-radius: 5px;
             margin: 10px 0;
+            border: 1px solid #6b2c2c;
         }
         .training-section {
             margin-top: 40px;
             padding-top: 20px;
-            border-top: 2px solid #eee;
+            border-top: 2px solid #555;
         }
         .tabs {
             display: flex;
@@ -771,14 +926,18 @@ def create_flask_app(vanna_instance: VannaMySQL) -> Flask:
         }
         .tab {
             padding: 10px 20px;
-            background-color: #e9ecef;
+            background-color: #404040;
             border: none;
             cursor: pointer;
             border-radius: 5px 5px 0 0;
             margin-right: 5px;
+            color: #e0e0e0;
+        }
+        .tab:hover {
+            background-color: #505050;
         }
         .tab.active {
-            background-color: #007bff;
+            background-color: #4a5568;
             color: white;
         }
         .tab-content {
@@ -803,6 +962,8 @@ def create_flask_app(vanna_instance: VannaMySQL) -> Flask:
         
         <button onclick="askQuestion()">🚀 生成SQL并查询</button>
         <button onclick="clearResults()">🗑️ 清空结果</button>
+        <button onclick="syncSchema()">🔄 同步数据库表结构</button>
+        <button onclick="showTables()">📋 查看数据库表</button>
         
         <div id="result"></div>
         
@@ -998,6 +1159,83 @@ def create_flask_app(vanna_instance: VannaMySQL) -> Flask:
             document.getElementById('question').value = '';
         }
         
+        function syncSchema() {
+            if (!confirm('确定要同步数据库表结构吗？这将自动识别并添加所有表的结构信息。')) {
+                return;
+            }
+            
+            fetch('/sync-schema', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                }
+            })
+            .then(response => response.json())
+            .then(result => {
+                if (result.success) {
+                    alert('✅ 数据库表结构同步成功！');
+                } else {
+                    alert('❌ 同步失败: ' + result.error);
+                }
+            })
+            .catch(error => {
+                alert('❌ 请求失败: ' + error);
+            });
+        }
+        
+        function showTables() {
+            fetch('/tables', {
+                method: 'GET',
+                headers: {
+                    'Content-Type': 'application/json',
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.tables) {
+                    displayTables(data.tables);
+                } else {
+                    alert('❌ 获取表信息失败: ' + data.error);
+                }
+            })
+            .catch(error => {
+                alert('❌ 请求失败: ' + error);
+            });
+        }
+        
+        function displayTables(tables) {
+            const resultDiv = document.getElementById('result');
+            let html = '<div class="result">';
+            
+            html += '<h3>📋 数据库表信息</h3>';
+            
+            if (Object.keys(tables).length === 0) {
+                html += '<p>未找到任何表</p>';
+            } else {
+                for (const [tableName, tableInfo] of Object.entries(tables)) {
+                    html += '<div style="margin-bottom: 20px; border: 1px solid #ddd; padding: 15px; border-radius: 5px;">';
+                    html += '<h4>表名: ' + tableName + '</h4>';
+                    html += '<table style="margin-top: 10px;">';
+                    html += '<tr><th>列名</th><th>数据类型</th><th>是否为空</th><th>键类型</th></tr>';
+                    
+                    tableInfo.columns.forEach(col => {
+                        html += '<tr>';
+                        html += '<td>' + col.name + '</td>';
+                        html += '<td>' + col.type + '</td>';
+                        html += '<td>' + col.null + '</td>';
+                        html += '<td>' + (col.key || '-') + '</td>';
+                        html += '</tr>';
+                    });
+                    
+                    html += '</table>';
+                    html += '</div>';
+                }
+            }
+            
+            html += '</div>';
+            resultDiv.innerHTML = html;
+        }
+        
         // 回车键提交
         document.getElementById('question').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
@@ -1056,6 +1294,38 @@ def create_flask_app(vanna_instance: VannaMySQL) -> Flask:
     def health():
         return jsonify({'status': 'healthy'})
     
+    @app.route('/sync-schema', methods=['POST'])
+    def sync_schema():
+        """同步数据库表结构"""
+        try:
+            if not vanna_instance.mysql_connector:
+                return jsonify({'success': False, 'error': '未连接到数据库'}), 400
+            
+            success = vanna_instance.refresh_database_schema()
+            
+            if success:
+                return jsonify({'success': True, 'message': '数据库表结构同步成功'})
+            else:
+                return jsonify({'success': False, 'error': '同步失败'}), 500
+                
+        except Exception as e:
+            logger.error(f"同步数据库表结构失败: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+    
+    @app.route('/tables', methods=['GET'])
+    def get_tables():
+        """获取数据库表信息"""
+        try:
+            if not vanna_instance.mysql_connector:
+                return jsonify({'error': '未连接到数据库'}), 400
+            
+            table_info = vanna_instance.mysql_connector.get_table_info()
+            return jsonify({'tables': table_info})
+            
+        except Exception as e:
+            logger.error(f"获取表信息失败: {e}")
+            return jsonify({'error': str(e)}), 500
+    
     return app
 
 
@@ -1097,46 +1367,23 @@ def main():
     
     if success:
         print("✅ MySQL 数据库连接成功！")
+        print("🔄 正在自动同步数据库表结构...")
     else:
         print("⚠️  MySQL 数据库连接失败，将在无数据库模式下运行")
     
-    # 预训练一些基础数据
+    # 添加一些基础文档和问答示例（不再手动添加DDL，因为会自动从数据库获取）
     print("📚 正在添加基础训练数据...")
     
-    # 添加一些基础DDL示例
-    vn.train(ddl="""
-    CREATE TABLE customers (
-        id INT PRIMARY KEY AUTO_INCREMENT,
-        name VARCHAR(100) NOT NULL,
-        email VARCHAR(100) UNIQUE,
-        phone VARCHAR(20),
-        signup_date DATE DEFAULT CURRENT_DATE,
-        status ENUM('active', 'inactive') DEFAULT 'active',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """)
+    # 添加通用文档
+    vn.train(documentation="这是一个业务数据库，包含客户、订单等相关信息")
+    vn.train(documentation="数据库使用MySQL，支持标准SQL查询语法")
+    vn.train(documentation="查询时请注意使用正确的表名和列名")
     
-    vn.train(ddl="""
-    CREATE TABLE orders (
-        id INT PRIMARY KEY AUTO_INCREMENT,
-        customer_id INT,
-        order_date DATE,
-        total_amount DECIMAL(10,2),
-        status VARCHAR(20),
-        FOREIGN KEY (customer_id) REFERENCES customers(id)
-    );
-    """)
-    
-    # 添加文档
-    vn.train(documentation="customers表存储客户的基本信息，包括姓名、邮箱、电话、注册日期和状态")
-    vn.train(documentation="orders表存储订单信息，通过customer_id与客户表关联")
-    vn.train(documentation="客户状态包括active(活跃)和inactive(非活跃)两种")
-    
-    # 添加问答示例
-    vn.train(question="有多少个客户？", sql="SELECT COUNT(*) as customer_count FROM customers")
-    vn.train(question="列出所有活跃客户", sql="SELECT * FROM customers WHERE status = 'active'")
-    vn.train(question="查询客户的订单数量", sql="SELECT c.name, COUNT(o.id) as order_count FROM customers c LEFT JOIN orders o ON c.id = o.customer_id GROUP BY c.id, c.name")
-    vn.train(question="今天的订单总金额", sql="SELECT SUM(total_amount) as daily_total FROM orders WHERE order_date = CURDATE()")
+    # 添加一些通用的问答示例
+    vn.train(question="查询表的记录数量", sql="SELECT COUNT(*) FROM table_name")
+    vn.train(question="查看表的所有数据", sql="SELECT * FROM table_name")
+    vn.train(question="按条件查询数据", sql="SELECT * FROM table_name WHERE condition")
+    vn.train(question="分组统计数据", sql="SELECT column, COUNT(*) FROM table_name GROUP BY column")
     
     print("✅ 基础训练数据添加完成！")
     
