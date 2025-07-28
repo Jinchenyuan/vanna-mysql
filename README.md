@@ -1,1 +1,1 @@
-# vanna-mysql
+# an vanna-mysql, AI power by ollama example.
